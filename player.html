@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+</head>
+<body>
+    <script>
+        let clockOffset = 0;
+        let outputLatency = 0;
+        let audioContext = null;
+        const SEGMENT_DURATION = 5; // seconds
+        const segmentBuffers = new Map(); // segment number -> AudioBuffer
+        let currentSegment = -1;
+        let playbackStartTime = 0; // audioContext time when playback started
+        let streamStartOffset = 0; // offset in seconds from start of stream
+
+        let serverStartTimeLocal = 0; // when the server started, in local clock ms
+
+        async function calibrateClock() {
+            const samples = [];
+
+            for (let i = 0; i < 3; i++) {
+                const t1 = Date.now();
+                const resp = await fetch('/time');
+                const data = await resp.json();
+                const t2 = Date.now();
+
+                const rtt = t2 - t1;
+                const localTimeAtServer = t1 + rtt / 2;
+                const serverUptime = data.uptime_seconds * 1000;
+                // When did the server start, in local clock terms?
+                const serverStartLocal = localTimeAtServer - serverUptime;
+
+                const serverTime = data.server_time_unix * 1000;
+                const offset = serverTime - localTimeAtServer;
+
+                samples.push({ rtt, serverStartLocal, offset });
+            }
+
+            // Use the sample with the lowest RTT as the best estimate
+            samples.sort((a, b) => a.rtt - b.rtt);
+            serverStartTimeLocal = samples[0].serverStartLocal;
+            clockOffset = samples[0].offset;
+
+            // Get audio output latency
+            audioContext = new AudioContext();
+            await audioContext.resume();
+            // outputLatency may not be populated until after a short delay
+            await new Promise(r => setTimeout(r, 100));
+            outputLatency = ((audioContext.outputLatency || 0) + (audioContext.baseLatency || 0)) * 1000; // convert to ms
+
+            // Notify parent frame
+            window.parent.postMessage({
+                type: 'clockCalibrated',
+                offset: clockOffset,
+                serverStartTimeLocal: serverStartTimeLocal,
+                outputLatency: outputLatency
+            }, '*');
+        }
+
+        function getPlaybackHead() {
+            // Returns where we should be in the audio stream (in seconds)
+            // = server uptime + audio output latency
+            const serverUptime = Date.now() - serverStartTimeLocal;
+            return (serverUptime + outputLatency) / 1000;
+        }
+
+        let downloadLatency = 0;
+
+        async function fetchSegment(segmentNum) {
+            if (segmentBuffers.has(segmentNum)) {
+                return segmentBuffers.get(segmentNum);
+            }
+            const t1 = Date.now();
+            const resp = await fetch(`/segment/${segmentNum}`);
+            const arrayBuffer = await resp.arrayBuffer();
+            const t2 = Date.now();
+            downloadLatency = t2 - t1;
+
+            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+            segmentBuffers.set(segmentNum, audioBuffer);
+            return audioBuffer;
+        }
+
+        function scheduleSegment(segmentNum, when, offset = 0) {
+            const buffer = segmentBuffers.get(segmentNum);
+            if (!buffer) return null;
+
+            const source = audioContext.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audioContext.destination);
+
+            const duration = buffer.duration - offset;
+            source.start(when, offset);
+
+            return { source, duration, endTime: when + duration };
+        }
+
+        async function startPlayback() {
+            // Fetch first segment to measure download latency
+            const initialHead = getPlaybackHead();
+            const initialSegmentNum = Math.floor(initialHead / SEGMENT_DURATION);
+            await fetchSegment(initialSegmentNum);
+
+            // Now recalculate where we should be, adding download latency as buffer
+            const bufferTime = downloadLatency / 1000 * 1.5; // 1.5x download time as safety margin
+            const playbackHead = getPlaybackHead() + bufferTime;
+
+            const segmentNum = Math.floor(playbackHead / SEGMENT_DURATION);
+            const offsetInSegment = playbackHead % SEGMENT_DURATION;
+
+            // Fetch the segment we'll actually start from (if different)
+            if (segmentNum !== initialSegmentNum) {
+                await fetchSegment(segmentNum);
+            }
+
+            // Prefetch next segment before starting playback
+            const nextSegmentPromise = fetchSegment(segmentNum + 1).catch(() => null);
+
+            currentSegment = segmentNum;
+
+            // Start playback
+            playbackStartTime = audioContext.currentTime;
+            const scheduled = scheduleSegment(segmentNum, playbackStartTime, offsetInSegment);
+
+            // Wait for next segment to be ready, then schedule it
+            await nextSegmentPromise;
+            if (segmentBuffers.has(segmentNum + 1)) {
+                scheduleNextSegments(segmentNum + 1, scheduled.endTime);
+            }
+        }
+
+        async function scheduleNextSegments(segmentNum, startTime) {
+            // Prefetch next segment
+            try {
+                await fetchSegment(segmentNum);
+            } catch (e) {
+                // No more segments
+                return;
+            }
+
+            const scheduled = scheduleSegment(segmentNum, startTime);
+            if (!scheduled) return;
+
+            currentSegment = segmentNum;
+
+            // Schedule the next one when this one is about to end
+            const timeUntilEnd = (scheduled.endTime - audioContext.currentTime) * 1000;
+            const prefetchTime = Math.max(0, timeUntilEnd - 2000); // 2 seconds before end
+
+            setTimeout(() => {
+                scheduleNextSegments(segmentNum + 1, scheduled.endTime);
+            }, prefetchTime);
+        }
+
+        async function init() {
+            await calibrateClock();
+            await startPlayback();
+        }
+
+        window.addEventListener('message', async (event) => {
+            if (event.data.type === 'startPlayback') {
+                await startPlayback();
+            }
+        });
+
+        init();
+    </script>
+</body>
+</html>
