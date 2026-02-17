@@ -77,9 +77,25 @@
             const t2 = Date.now();
             downloadLatency = t2 - t1;
 
-            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-            segmentBuffers.set(segmentNum, audioBuffer);
-            return audioBuffer;
+            // Decode the compressed audio to get raw PCM
+            const decodedBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+            // Create a new AudioBuffer and copy all the decoded samples
+            // This ensures the entire segment is fully decoded and sample-accurate seeking works
+            const fullyDecodedBuffer = audioContext.createBuffer(
+                decodedBuffer.numberOfChannels,
+                decodedBuffer.length,
+                decodedBuffer.sampleRate
+            );
+
+            for (let channel = 0; channel < decodedBuffer.numberOfChannels; channel++) {
+                const sourceData = decodedBuffer.getChannelData(channel);
+                const destData = fullyDecodedBuffer.getChannelData(channel);
+                destData.set(sourceData);
+            }
+
+            segmentBuffers.set(segmentNum, fullyDecodedBuffer);
+            return fullyDecodedBuffer;
         }
 
         function scheduleSegment(segmentNum, when, offset = 0) {
